@@ -1,0 +1,140 @@
+/**
+ * Formats ISO date string to UI format: MM/DD/YYYY HH:mm (EST/EDT)
+ */
+export function formatTransactionDate(isoString) {
+  if (!isoString) return '-';
+  const date = new Date(isoString);
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/New_York',
+    month: '2-digit',
+    day: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(date);
+
+  const p = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return `${p.month}/${p.day}/${p.year} ${p.hour}:${p.minute}`;
+}
+
+/**
+ * Transforms API transactions array to match the UI table structure
+ */
+export function transformTransactionRecords(apiData) {
+  const transactions = apiData.transactions || [];
+
+  return transactions.map((item) => ({
+    date: formatTransactionDate(item.date),
+    description: item.description?.trim() || '-',
+    transCode: item.code?.trim() || '-',
+    status: item.status?.trim() || '-',
+    amount: item.transactionAmount
+      ? Number(item.transactionAmount).toFixed(2)
+      : '-',
+    balance: item.balanceAmount
+      ? Number(item.balanceAmount).toLocaleString('en-US', {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2,
+        })
+      : '-',
+  }));
+}
+
+
+
+
+
+
+
+
+
+
+
+
+export class TransactionsPage {
+  constructor(page) {
+    this.page = page;
+    this.transactionsTab = page.locator('text=Transactions*');
+    // Targets the rows of the Posted / Pending eCheck table
+    this.tableRows = page.locator('table tbody tr');
+  }
+
+  /**
+   * Clicks the Transactions tab and intercepts the generalInfo API call
+   */
+  async openTransactionsAndInterceptApi() {
+    const [response] = await Promise.all([
+      this.page.waitForResponse(
+        (res) =>
+          res.url().includes('generalInfo') &&
+          res.request().method() === 'GET' && // Adjust to 'POST' if the request method is POST
+          res.status() === 200
+      ),
+      this.transactionsTab.click(),
+    ]);
+
+    return await response.json();
+  }
+
+  /**
+   * Reads UI rows and maps visible columns to an array of objects
+   */
+  async getVisibleTransactionsTableData() {
+    await this.tableRows.first().waitFor({ state: 'visible' });
+
+    return await this.tableRows.evaluateAll((rows) => {
+      return rows.map((row) => {
+        const cells = Array.from(row.querySelectorAll('td')).map((td) =>
+          td.innerText.trim()
+        );
+
+        // Adjust indices if your table includes or hides the Credit/Debit column
+        return {
+          date: cells[1] || '-',
+          description: cells[3] || '-',
+          transCode: cells[4] || '-',
+          status: cells[5] || '-',
+          amount: cells[6] || '-',
+          balance: cells[7] || '-',
+        };
+      });
+    });
+  }
+}
+
+
+
+
+
+
+
+
+
+
+import { test, expect } from '@playwright/test';
+import { LoginPage } from '../pages/LoginPage';
+import { TransactionsPage } from '../pages/TransactionsPage';
+import { transformTransactionRecords } from '../utils/transactionFormatter';
+
+test('Validate Transactions API generalInfo payload matches UI table', async ({ page }) => {
+  const loginPage = new LoginPage(page);
+  const transactionsPage = new TransactionsPage(page);
+
+  // 1. Navigate and search customer ID 10515852
+  await loginPage.navigate();
+  await loginPage.fraudDeposit('10515852');
+
+  // 2. Click Transactions tab and capture generalInfo response
+  const apiData = await transactionsPage.openTransactionsAndInterceptApi();
+
+  // 3. Transform API payload
+  const expectedData = transformTransactionRecords(apiData);
+
+  // 4. Extract UI table data
+  const actualUIData = await transactionsPage.getVisibleTransactionsTableData();
+
+  // 5. Assert first N records or full list
+  expect(actualUIData).toEqual(expectedData);
+});
+
