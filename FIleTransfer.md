@@ -1,67 +1,105 @@
-<!DOCTYPE html>
-<html>
-<head>
-  <style>
-    body { width: 340px; font-family: system-ui, sans-serif; padding: 10px; }
-    textarea { width: 100%; box-sizing: border-box; }
-    button { margin-top: 6px; padding: 6px 12px; }
-    #out { white-space: pre-wrap; margin-top: 10px; font-size: 13px; }
-  </style>
-</head>
-<body>
-  <textarea id="instruction" rows="3">Summarise this page in 5 bullet points.</textarea>
-  <button id="go">Ask AI</button>
-  <div id="out"></div>
-  <script src="popup.js"></script>
-</body>
-</html>
+test('Non-Monetary sorting validation (Account and Date columns)', async ({ page }) => {
+        test.setTimeout(240000);
 
+        const nonMonetaryTable = new NonMonitoringTable(page);
+        const apiRecords = await openNonMonetary(page);
+        let verifiedColumns = 0;
 
+        for (const { key, header, compare } of sortColumns) {
+            await test.step(`Sort by ${header}`, async () => {
+                const apiValues = apiRecords.map((record) => record[key]);
 
-const API_KEY = "PASTE_YOUR_GEMINI_KEY_HERE";
-const MODEL = "gemini-flash-latest";
+                // Sorting cannot be proven when every row has the same value
+                if (new Set(apiValues).size < 2) {
+                    test.info().annotations.push({
+                        type: 'column skipped',
+                        description: `${header}: all values are the same, use a customer with different values`
+                    });
+                    return;
+                }
 
-document.getElementById("go").addEventListener("click", async () => {
-  const out = document.getElementById("out");
-  const instruction = document.getElementById("instruction").value;
-  out.textContent = "Reading page...";
+                // Expected orders come from the API data
+                const asc = [...apiValues].sort(compare);
+                const desc = [...asc].reverse();
 
-  // 1. Which tab am I looking at?
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+                const readColumn = async () =>
+                    (await nonMonetaryTable.getTableRecords()).map((record) => normalize(record)[key]);
+                const readDirection = async () => directionOf(await readColumn(), asc, desc);
 
-  // 2. Run a tiny function inside that page to grab its visible text
-  const [{ result: pageText }] = await chrome.scripting.executeScript({
-    target: { tabId: tab.id },
-    func: () => document.body.innerText.slice(0, 20000)
-  });
+                // 1st click: UI must be sorted exactly like the API data (asc or desc)
+                const startDirection = await readDirection();
+                await nonMonetaryTable.sortBy(header);
+                await expect
+                    .poll(readDirection, {
+                        timeout: 15000,
+                        message: `${header}: after the 1st click the UI order should match the API data sorted (API asc: ${asc.join(', ')})`
+                    })
+                    .toMatch(
+                        startDirection === 'none'
+                            ? /^(asc|desc)$/
+                            : new RegExp(`^${startDirection === 'asc' ? 'desc' : 'asc'}$`)
+                    );
+                const firstDirection = await readDirection();
 
-  out.textContent = "Thinking...";
+                // 2nd click: the order must flip
+                await nonMonetaryTable.sortBy(header);
+                await expect
+                    .poll(readDirection, {
+                        timeout: 15000,
+                        message: `${header}: after the 2nd click the order should be reversed`
+                    })
+                    .toBe(firstDirection === 'asc' ? 'desc' : 'asc');
 
-  // 3. Send the instruction + page text to the model
-  const prompt = `${instruction}
+                verifiedColumns++;
+            });
+        }
 
---- PAGE TITLE ---
-${tab.title}
---- PAGE CONTENT ---
-${pageText}`;
-
-  try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": API_KEY
-        },
-        body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
-      }
-    );
-    const data = await res.json();
-    out.textContent =
-      data?.candidates?.[0]?.content?.parts?.[0]?.text ??
-      "No answer. Raw response: " + JSON.stringify(data).slice(0, 400);
-  } catch (e) {
-    out.textContent = "Error: " + e.message;
-  }
+        test.skip(verifiedColumns === 0, 'No column could be verified: all values are the same for this customer');
+    });
 });
+
+
+
+
+
+
+export class NonMonitoringTable {
+    constructor(page) {
+        this.page = page;
+        // \s* because the text may be split across two elements with no space between them
+        this.sectionHeading = page.getByText(/Non-Monetary\s*\(Last \d+ Days?\)/i);
+        // The table sits inside div#nonmonetary-table (DevTools > Elements)
+        this.nonMonetarytable = page.locator('#nonmonetary-table table');
+        this.tableHeaders = this.nonMonetarytable.locator('thead th');
+        this.tableRows = this.nonMonetarytable.locator('tbody tr');
+    }
+
+    // Clicks the sort toggle of a column header, e.g. sortBy('Account') or sortBy('Date')
+    async sortBy(columnName) {
+        await this.tableHeaders
+            .filter({ hasText: columnName })
+            .locator('[title="Toggle SortBy"]')
+            .click();
+    }
+
+    async getTableRecords() {
+        // Wait for the table rows (id seen in DevTools) instead of the heading text
+        await this.tableRows.first().waitFor({ state: 'visible', timeout: 60000 });
+
+        const rows = await this.tableRows.all();
+        const records = [];
+
+        for (const row of rows) {
+            const cells = row.locator('td');
+            records.push({
+                accountNumber: (await cells.nth(0).innerText()).trim(),
+                date: (await cells.nth(1).innerText()).trim(),
+                description: (await cells.nth(2).innerText()).trim()
+            });
+        }
+        return records;
+    }
+}
+
+
+
