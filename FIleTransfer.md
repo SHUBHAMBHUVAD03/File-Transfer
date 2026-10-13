@@ -1,4 +1,81 @@
-test('Non-Monetary sorting validation (Account and Date columns)', async ({ page }) => {
+import { test, expect } from '@playwright/test';
+import { NonMonitoringTable } from '../pages/NonMonitoringTable';
+import { LoginPage } from '../pages/LoginPage';
+
+// Same clean-up for UI and API values: collapse extra spaces and trim
+const clean = (value) => String(value ?? '').replace(/\s+/g, ' ').trim();
+
+const normalize = (record) => ({
+    accountNumber: clean(record.accountNumber),
+    date: clean(record.date),
+    description: clean(record.description)
+});
+
+// Sort key, so the comparison does not depend on row order
+const byKey = (a, b) =>
+    `${a.accountNumber}|${a.date}|${a.description}`.localeCompare(
+        `${b.accountNumber}|${b.date}|${b.description}`
+    );
+
+// ---- sorting helpers (only Account and Date have a sort toggle) ----
+const toTime = (value) => {
+    const [month, day, year] = value.split('/').map(Number); // MM/DD/YYYY
+    return Date.UTC(year, month - 1, day);
+};
+
+const sortColumns = [
+    { key: 'accountNumber', header: 'Account', compare: (a, b) => a.localeCompare(b, undefined, { numeric: true }) },
+    { key: 'date', header: 'Date', compare: (a, b) => toTime(a) - toTime(b) }
+];
+
+const sameOrder = (a, b) => a.length === b.length && a.every((value, i) => value === b[i]);
+
+const directionOf = (values, asc, desc) =>
+    sameOrder(values, asc) ? 'asc' : sameOrder(values, desc) ? 'desc' : 'none';
+
+// Login, open the Transactions tab and return the nmgetdata records (cleaned)
+async function openNonMonetary(page) {
+    const loginPage = new LoginPage(page);
+
+    // Start listening BEFORE login so the nmgetdata call cannot be missed.
+    // The timeout clock starts here, so allow time for login + customer search.
+    const apiResponsePromise = page.waitForResponse(
+        (response) =>
+            response.url().includes('/fact-ai-api/processor/nmgetdata') &&
+            response.request().method() === 'POST' &&
+            response.status() === 200,
+        { timeout: 120000 }
+    );
+    apiResponsePromise.catch(() => {}); // avoids "unhandled rejection" noise if the test fails earlier
+
+    await loginPage.login();
+    await loginPage.fraudDeposit('36992');
+    await page.locator('//a[text() = "Transactions"]').click();
+
+    const response = await apiResponsePromise;
+    const apiData = await response.json();
+    expect(Array.isArray(apiData.finalArray), 'nmgetdata response should contain finalArray').toBe(true);
+    return apiData.finalArray.map(normalize);
+}
+
+test.describe('Non-Monetary section validation', () => {
+    test('Non-Monetary section UI vs API validation', async ({ page }) => {
+        test.setTimeout(180000);
+
+        const nonMonetaryTable = new NonMonitoringTable(page);
+        const apiRecords = await openNonMonetary(page);
+
+        // UI data
+        const uiRecords = (await nonMonetaryTable.getTableRecords()).map(normalize);
+
+        // 1. Same number of records
+        expect(uiRecords.length).toBe(apiRecords.length);
+
+        // 2. Same data in every record (row order is ignored)
+        expect(uiRecords.sort(byKey)).toEqual(apiRecords.sort(byKey));
+    });
+
+    test('Non-Monetary sorting validation (Account and Date columns)', async ({ page }) => {
         test.setTimeout(240000);
 
         const nonMonetaryTable = new NonMonitoringTable(page);
@@ -57,49 +134,3 @@ test('Non-Monetary sorting validation (Account and Date columns)', async ({ page
         test.skip(verifiedColumns === 0, 'No column could be verified: all values are the same for this customer');
     });
 });
-
-
-
-
-
-
-export class NonMonitoringTable {
-    constructor(page) {
-        this.page = page;
-        // \s* because the text may be split across two elements with no space between them
-        this.sectionHeading = page.getByText(/Non-Monetary\s*\(Last \d+ Days?\)/i);
-        // The table sits inside div#nonmonetary-table (DevTools > Elements)
-        this.nonMonetarytable = page.locator('#nonmonetary-table table');
-        this.tableHeaders = this.nonMonetarytable.locator('thead th');
-        this.tableRows = this.nonMonetarytable.locator('tbody tr');
-    }
-
-    // Clicks the sort toggle of a column header, e.g. sortBy('Account') or sortBy('Date')
-    async sortBy(columnName) {
-        await this.tableHeaders
-            .filter({ hasText: columnName })
-            .locator('[title="Toggle SortBy"]')
-            .click();
-    }
-
-    async getTableRecords() {
-        // Wait for the table rows (id seen in DevTools) instead of the heading text
-        await this.tableRows.first().waitFor({ state: 'visible', timeout: 60000 });
-
-        const rows = await this.tableRows.all();
-        const records = [];
-
-        for (const row of rows) {
-            const cells = row.locator('td');
-            records.push({
-                accountNumber: (await cells.nth(0).innerText()).trim(),
-                date: (await cells.nth(1).innerText()).trim(),
-                description: (await cells.nth(2).innerText()).trim()
-            });
-        }
-        return records;
-    }
-}
-
-
-
